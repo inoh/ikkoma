@@ -2,6 +2,48 @@ import { and, asc, eq, isNull } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { milestones, topicMenuTemplates, topics } from "@/lib/db/schema";
 
+const COLORS = ["topic/1", "topic/2", "topic/3", "topic/4", "topic/5", "topic/6"];
+
+export type TopicDraft = {
+  topicTitle: string;
+  goal: string;
+  currentState?: string;
+  firstNextAction?: string;
+  milestones?: { code: string; title: string; detail?: string }[];
+  menuTemplate?: { blockKind: string; minutes: number; instruction: string }[];
+};
+
+/**
+ * トピックを新規作成する。オンボーディング（API 経由）と MCP の両方から呼ばれる。
+ * active が2つある状態での追加は止めないが警告を返す（3つ目は週次配分が破綻しやすい）。
+ */
+export async function createTopic(userId: string, draft: TopicDraft) {
+  const actives = await activeTopics(userId);
+  const warning = actives.length >= 2
+    ? "active が既に2つあります。3つ目は週次リズムが破綻しやすいので、どれかを中断することを勧めます。"
+    : null;
+
+  const [t] = await db.insert(topics).values({
+    userId, title: draft.topicTitle, goal: draft.goal,
+    currentState: draft.currentState ?? "",
+    nextActions: draft.firstNextAction ? [draft.firstNextAction] : [],
+    colorToken: COLORS[actives.length % COLORS.length],
+  }).returning();
+
+  if (draft.milestones?.length) {
+    await db.insert(milestones).values(draft.milestones.map((m, i) => ({
+      topicId: t.id, code: m.code, title: m.title, detail: m.detail ?? null, orderIndex: i,
+    })));
+  }
+  if (draft.menuTemplate?.length) {
+    await db.insert(topicMenuTemplates).values(draft.menuTemplate.map((b, i) => ({
+      topicId: t.id, blockKind: b.blockKind as never, minutes: b.minutes,
+      instruction: b.instruction, orderIndex: i,
+    })));
+  }
+  return { topic: t, warning };
+}
+
 /** 現在のマイルストーン = 未完了のうち order_index 最小。テーブルには持たず都度導出する */
 export async function currentMilestone(topicId: string) {
   const rows = await db.select().from(milestones)

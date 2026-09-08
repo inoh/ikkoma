@@ -31,7 +31,41 @@
   「他人のデータが見えた」事故を構造的に防げる
 - **Claude API**：ストリーミング応答が学習セッションの体験に直結する
 
-## AI パートの設計
+## 2つの実行モード
+
+AI をサーバーに置くかどうかで2通りの動かし方がある。service 層を
+**「材料を集める関数」と「結果を検証して保存する関数」**に割り、その間に誰が入るかだけを変える。
+
+```
+  buildMenuContext()  ──►  [ 思考する主体 ]  ──►  saveMenu()
+  buildDrillContext()                            saveDrill()
+  buildCorrectionContext()                       saveCorrection()
+  buildCompletionContext()                       applyCompletion()
+                              │
+        API モード ───────────┤  Claude API（lib/ai/*）
+        MCP モード ───────────┘  接続元のモデル（Claude Code など）
+```
+
+| | API モード | MCP モード |
+|---|---|---|
+| AI の実行場所 | Vercel Functions | 接続元のクライアント |
+| `ANTHROPIC_API_KEY` | 必要 | **不要** |
+| デプロイ | Vercel | ローカルのみ |
+| 通知 | Vercel Cron | クライアント側のスケジューラ |
+| セッション UI | S2（Web） | クライアントの対話 |
+| 複数人対応 | 可能 | 不可（各自がクライアントを持つ必要がある） |
+
+**検証は保存関数側にあるので、どちらのモードでも品質保証は同じ。**
+これが設計上の要点。MCP 経由でモデルが曖昧なメニューを渡してきた場合も `saveMenu` が
+`MenuValidationError` で違反箇所を返し、モデルが直して再送する。
+API 側の「生成 → 検証 → 1回リトライ」と同じループが、駆動する側を変えて成立する。
+
+MCP サーバー（`mcp/server.ts`）は22ツールを公開する。ツールの description と
+サーバーの instructions が、API モードのシステムプロンプトに相当する役割を果たす。
+とくに `correction_context` は既知の弱点型を返し、
+「同じ性質のミスは必ず名寄せすること」を description で強制している。
+
+## AI パートの設計（API モード）
 
 AI の呼び出しは4種類。**それぞれ独立したプロンプトとスキーマを持つ**（1つの巨大プロンプトにしない）。
 

@@ -3,9 +3,9 @@ import { db } from "@/lib/db";
 import {
   attempts, corrections, menuItems, messages, sessions, streaks, topics, weaknessTypes,
 } from "@/lib/db/schema";
-import { nextDrill } from "@/lib/ai/drill";
-import { correct as aiCorrect } from "@/lib/ai/correction";
-import { completeSession as aiComplete } from "@/lib/ai/complete";
+import { nextDrill, type Drill, type DrillRequest } from "@/lib/ai/drill";
+import { correct as aiCorrect, type CorrectionRequest, type CorrectionResult } from "@/lib/ai/correction";
+import { completeSession as aiComplete, type CompleteRequest, type CompleteResult } from "@/lib/ai/complete";
 import { applyStudyDay } from "@/lib/domain/streak";
 import { currentMilestone } from "./topics";
 import { applyReviewOutcome, pickTargets, recordDetectedTypes } from "./weakness";
@@ -45,15 +45,17 @@ export async function getSession(sessionId: string) {
   return { ...row, messages: msgs, attempts: atts, corrections: corrs };
 }
 
-/** 次の1問を出題する。狙う弱点は重み付き抽選で決める */
-export async function issueDrill(sessionId: string, userId: string, today: string) {
+/* ---------------- 出題 ---------------- */
+
+/** 出題に必要な材料。狙う弱点は重み付き抽選済みで入る */
+export async function buildDrillContext(
+  sessionId: string, userId: string, today: string,
+): Promise<DrillRequest> {
   const s = await getSession(sessionId);
   if (!s) throw new Error("session not found");
-
   const ms = await currentMilestone(s.topic.id);
   const targets = await pickTargets(userId, s.topic.id, today, 1);
-
-  const drill = await nextDrill({
+  return {
     topicTitle: s.topic.title,
     instruction: s.item?.instruction ?? s.topic.goal,
     currentMilestone: ms ? `${ms.code} ${ms.title}` : null,
@@ -61,14 +63,22 @@ export async function issueDrill(sessionId: string, userId: string, today: strin
       id: t.type.id, label: t.type.label, description: t.type.description, exampleWrong: t.type.exampleWrong,
     })),
     recentQuestions: s.attempts.slice(-5).map((a) => a.question),
-  });
+  };
+}
 
+export async function saveDrill(sessionId: string, drill: Drill) {
   const [row] = await db.insert(attempts).values({
     sessionId, question: drill.question, choices: drill.choices ?? null,
     correctAnswer: drill.correctAnswer, explanation: drill.explanation,
     targetTypeIds: drill.targetTypeIds ?? [],
   }).returning();
   return row;
+}
+
+/** API 経由の経路 */
+export async function issueDrill(sessionId: string, userId: string, today: string) {
+  const ctx = await buildDrillContext(sessionId, userId, today);
+  return saveDrill(sessionId, await nextDrill(ctx));
 }
 
 /** 解答を採点し、狙っていた弱点の間隔反復に反映する */
@@ -87,34 +97,44 @@ function normalize(s: string) {
   return s.trim().toLowerCase().replace(/[.。、,\s]/g, "");
 }
 
-/** 自由記述の添削。既知の型を渡して名寄せさせるのが肝 */
-export async function submitWriting(sessionId: string, userId: string, userText: string) {
+/* ---------------- 添削 ---------------- */
+
+/**
+ * 添削の材料。既知の弱点型を必ず含める。
+ * これを渡さないと同じミスに毎回違うラベルが付き、弱点リストが名寄せできずに壊れる。
+ */
+export async function buildCorrectionContext(
+  sessionId: string, userId: string, userText: string,
+): Promise<CorrectionRequest> {
   const s = await getSession(sessionId);
   if (!s) throw new Error("session not found");
-
   const known = await db.select().from(weaknessTypes)
     .where(and(eq(weaknessTypes.userId, userId), eq(weaknessTypes.topicId, s.topic.id)));
-
-  const result = await aiCorrect({
+  return {
     topicTitle: s.topic.title,
     instruction: s.item?.instruction ?? s.topic.goal,
     userText,
-    knownTypes: known
-      .filter((k) => k.status !== "dismissed")
+    knownTypes: known.filter((k) => k.status !== "dismissed")
       .map((k) => ({ id: k.id, label: k.label, description: k.description })),
-  });
+  };
+}
 
+export async function saveCorrection(sessionId: string, userText: string, result: CorrectionResult) {
   const [row] = await db.insert(corrections).values({
     sessionId, userText, correctedText: result.correctedText,
     diff: result.diff, feedback: result.feedback,
   }).returning();
-
   await db.insert(messages).values([
     { sessionId, role: "user", content: userText },
     { sessionId, role: "assistant", content: result.feedback },
   ]);
-
   return { correction: row, detectedTypes: result.detectedTypes };
+}
+
+/** API 経由の経路 */
+export async function submitWriting(sessionId: string, userId: string, userText: string) {
+  const ctx = await buildCorrectionContext(sessionId, userId, userText);
+  return saveCorrection(sessionId, userText, await aiCorrect(ctx));
 }
 
 export async function addMessage(sessionId: string, role: "user" | "assistant", content: string) {
@@ -122,27 +142,23 @@ export async function addMessage(sessionId: string, role: "user" | "assistant", 
   return m;
 }
 
-/**
- * セッション完了。ここでログ・ストリーク・弱点の下書きがまとめて確定する。
- * ユーザーは S3 で弱点を承認するだけでよい（記録を書かせない）。
- */
-export async function finishSession(sessionId: string, userId: string, today: string) {
+/* ---------------- 完了 ---------------- */
+
+export async function buildCompletionContext(
+  sessionId: string, userId: string,
+): Promise<CompleteRequest & { alreadyCompleted: boolean }> {
   const s = await getSession(sessionId);
   if (!s) throw new Error("session not found");
-  if (s.session.state === "completed") return summarize(sessionId, userId);
-
-  const durationMinutes = Math.max(
-    1, Math.round((Date.now() - s.session.startedAt.getTime()) / 60_000),
-  );
   const ms = await currentMilestone(s.topic.id);
   const known = await db.select().from(weaknessTypes)
     .where(and(eq(weaknessTypes.userId, userId), eq(weaknessTypes.topicId, s.topic.id)));
 
-  const result = await aiComplete({
+  return {
+    alreadyCompleted: s.session.state === "completed",
     topicTitle: s.topic.title,
     currentState: s.topic.currentState,
     currentMilestone: ms ? `${ms.code} ${ms.title}` : null,
-    durationMinutes,
+    durationMinutes: elapsedMinutes(s.session.startedAt),
     attempts: s.attempts.map((a) => ({
       question: a.question, userAnswer: a.userAnswer, correctAnswer: a.correctAnswer, isCorrect: a.isCorrect,
     })),
@@ -151,10 +167,28 @@ export async function finishSession(sessionId: string, userId: string, today: st
     })),
     knownTypes: known.filter((k) => k.status !== "dismissed")
       .map((k) => ({ id: k.id, label: k.label, description: k.description })),
-  });
+  };
+}
+
+function elapsedMinutes(startedAt: Date) {
+  return Math.max(1, Math.round((Date.now() - startedAt.getTime()) / 60_000));
+}
+
+/**
+ * セッション完了の確定処理。
+ * ログ・ストリーク・現在地・弱点の下書きがここでまとめて書かれる（ユーザーには書かせない）。
+ */
+export async function applyCompletion(
+  sessionId: string, userId: string, today: string, result: CompleteResult,
+) {
+  const s = await getSession(sessionId);
+  if (!s) throw new Error("session not found");
+  if (s.session.state === "completed") return summarize(sessionId, userId);
 
   await db.update(sessions).set({
-    state: "completed", endedAt: new Date(), durationMinutes, summary: result.summary,
+    state: "completed", endedAt: new Date(),
+    durationMinutes: elapsedMinutes(s.session.startedAt),
+    summary: result.summary,
   }).where(eq(sessions.id, sessionId));
 
   if (s.session.menuItemId) {
@@ -169,7 +203,6 @@ export async function finishSession(sessionId: string, userId: string, today: st
     userId, topicId: s.topic.id, sessionId, today, detected: result.detectedTypes,
   });
 
-  // ストリーク更新（日付単位で冪等）
   const [cur] = await db.select().from(streaks).where(eq(streaks.userId, userId));
   const next = applyStudyDay({
     currentStreak: cur?.currentStreak ?? 0,
@@ -181,6 +214,14 @@ export async function finishSession(sessionId: string, userId: string, today: st
     .onConflictDoUpdate({ target: streaks.userId, set: next });
 
   return summarize(sessionId, userId);
+}
+
+/** API 経由の経路 */
+export async function finishSession(sessionId: string, userId: string, today: string) {
+  const ctx = await buildCompletionContext(sessionId, userId);
+  if (ctx.alreadyCompleted) return summarize(sessionId, userId);
+  const { alreadyCompleted: _ignored, ...req } = ctx;
+  return applyCompletion(sessionId, userId, today, await aiComplete(req));
 }
 
 /** S3 (結果画面) に出すデータ */

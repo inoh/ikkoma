@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "ikkoma": {
+      "command": "npx",
+      "args": ["tsx", "--tsconfig", "tsconfig.json", "mcp/server.ts"]
+    }
+  }
+}

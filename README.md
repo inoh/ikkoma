@@ -54,10 +54,67 @@ createdb ikkoma_test && TEST_DATABASE_URL=postgres://localhost:5432/ikkoma_test 
 npm run test:integration      # コアループの統合テスト（AI のみスタブ・10件）
 ```
 
+```bash
+npm run mcp:smoke             # MCP サーバーを子プロセスで起動して22ツールを叩く
+```
+
 統合テストは AI 呼び出しだけをスタブし、DB とサービス層は本物を通す。
 API キーなしでコアループ全体（生成→出題→採点→添削→完了→承認→間隔反復）を検証できる。
+`mcp:smoke` は MCP 経由で同じループを通し、不正なメニューが弾かれることまで確認する。
 
-## 構成
+## 2つの動かし方
+
+Ikkoma は **AI をサーバーに持つ / 持たない** の両方で動く。service 層が「材料を集める関数」と
+「結果を検証して保存する関数」に分かれていて、その間に誰が入るかだけが違う。
+
+```
+                      buildMenuContext()          saveMenu()  ← 検証はここ
+                            │                        ▲
+  ┌── API モード ───────────┼── Claude API ──────────┤   ANTHROPIC_API_KEY が要る
+  │                         │                        │   Vercel にデプロイできる
+  └── MCP モード ───────────┴── Claude Code ─────────┘   API キー不要（サブスクで動く）
+                                （接続元のモデル）        ローカル専用
+```
+
+**検証は保存関数側にある**ので、どちらの経路でも品質保証は同じ。
+MCP 経由でモデルが曖昧なメニューを渡してきた場合も `save_menu` が違反箇所を列挙して差し戻し、
+モデルが直して再送する。API 側の「生成→検証→リトライ」と同じループが向きを変えて成立する。
+
+### MCP モード（API キー不要）
+
+Claude Code から接続して使う。学習の思考は Claude Code 側のモデルが行い、
+Ikkoma は状態の保存と検証だけを担う。`ANTHROPIC_API_KEY` は不要。
+
+```bash
+npm run mcp          # 単体起動（動作確認用）
+npm run mcp:smoke    # コアループの疎通確認
+```
+
+このリポジトリで `claude` を起動すれば `.mcp.json` が読まれて自動で繋がる。
+別のプロジェクト（例: study リポジトリ）から使う場合は、そちらの `.mcp.json` にこう書く。
+
+```json
+{
+  "mcpServers": {
+    "ikkoma": {
+      "command": "npx",
+      "args": ["tsx", "--tsconfig", "/path/to/ikkoma/tsconfig.json", "/path/to/ikkoma/mcp/server.ts"]
+    }
+  }
+}
+```
+
+`.env` はリポジトリ基準で解決するので、どの cwd から起動しても動く。
+公開ツールは22個。詳細は `mcp/server.ts` のサーバー instructions を参照。
+
+**MCP モードの制約**
+
+- **通知が成立しない** — MCP サーバーは自分から動けない。Claude Code のスケジュールタスクで代替する
+- **Web の対話画面（S2）は使わない** — 学習は Claude Code の中で起きる。Web は閲覧用になる
+- **複数人対応には使えない** — 各ユーザーが自分の Claude Code とローカル環境を持つ必要がある。
+  Phase 2 では API モードに戻る
+
+### API モード（Vercel にデプロイする場合）
 
 サーバレス前提。アイドル時のコストがゼロになる組み合わせを選んでいる。
 
@@ -102,14 +159,15 @@ AI の過剰抽出で弱点リストが汚れるのを防ぐ。
 
 ```
 app/            画面（S1–S9）と API ルート
-  api/          15 エンドポイント
+  api/          16 エンドポイント
+mcp/            MCP サーバー（22ツール・AI を持たない）
 lib/
   domain/       純粋ロジック（間隔反復・ストリーク・メニュー検証）+ テスト
-  ai/           Claude 呼び出し4種 + 構造化出力
-  services/     DB とドメインとAIを繋ぐ層
+  ai/           Claude 呼び出し4種 + 構造化出力（API モードでのみ使う）
+  services/     材料を集める関数 と 検証して保存する関数。両モードが共有する
   db/           Drizzle スキーマ（17テーブル）
 components/     UI コンポーネント
-scripts/        study リポジトリからの移行
+scripts/        study リポジトリからの移行 / MCP 疎通確認
 docs/           設計ドキュメント
 ```
 
@@ -132,3 +190,6 @@ docs/           設計ドキュメント
 
 Phase 1（MVP・単一ユーザー）実装済み。認証はまだ無く、`IKKOMA_USER_ID` の1人で動く。
 スキーマは最初から `user_id` で分離してあるので、Phase 2 の複数人対応は認証と RLS の追加で足りる。
+
+いまは **MCP モードで運用**する想定（API キー不要）。Phase 2 で複数人に開くとき、
+`lib/ai/*` を再接続するだけで API モードに移れる。捨てる作業はない。

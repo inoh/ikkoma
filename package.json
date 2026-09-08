@@ -14,10 +14,13 @@
     "db:seed": "tsx scripts/import-study.ts",
     "db:import-study": "tsx scripts/import-study.ts",
     "test:integration": "DATABASE_URL=${TEST_DATABASE_URL:-postgres://localhost:5432/ikkoma_test} vitest run lib/__tests__",
-    "test:all": "npm run test && npm run test:integration"
+    "test:all": "npm run test && npm run test:integration",
+    "mcp": "tsx --tsconfig tsconfig.json mcp/server.ts",
+    "mcp:smoke": "DATABASE_URL=${TEST_DATABASE_URL:-postgres://localhost:5432/ikkoma_test} tsx scripts/mcp-smoke.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@neondatabase/serverless": "^0.10.4",
     "drizzle-orm": "^0.36.4",
     "next": "^15.1.0",
