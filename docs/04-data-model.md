@@ -10,7 +10,8 @@ users ─┬─< topics ─┬─< milestones
        ├─< rhythm_phases ─< rhythm_slots
        ├─< daily_menus ─< menu_items ─── sessions
        ├─< sessions ─┬─< attempts
-       │             └─< corrections
+       │             ├─< corrections
+       │             └─< messages
        ├─── streak    (1:1)
        └─< notification_settings
 
@@ -108,6 +109,9 @@ MVP でも最初から `user_id` を入れておく。後付けは高くつく�
 実際の学習実施記録（D）。
 
 **sessions**：`user_id`, `topic_id`, `menu_item_id`, `started_at`, `ended_at`, `duration_minutes`, `summary`(text, AI 生成), `state`(`in_progress`/`completed`/`abandoned`)
+
+**messages**（セッション中の対話ログ。実装時に追加）
+`session_id`, `role`(`user`/`assistant`), `content`, `created_at`
 
 **attempts**（ドリルの1問1答）
 
