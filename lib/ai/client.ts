@@ -8,7 +8,7 @@ import Anthropic from "@anthropic-ai/sdk";
  */
 export const MODELS = {
   /** 高頻度・低単価: 出題、添削 */
-  fast: "claude-haiku-4-5-20251001",
+  fast: "claude-haiku-4-5",
   /** 低頻度・高品質: メニュー生成、セッション要約と弱点抽出 */
   smart: "claude-sonnet-5",
 } as const;
