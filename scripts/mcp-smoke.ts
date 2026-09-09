@@ -6,11 +6,28 @@
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import postgres from "postgres";
+
+const DB = process.env.DATABASE_URL;
+if (!DB) throw new Error("DATABASE_URL を指定してください（例: postgres://localhost:5432/ikkoma_test）");
+if (!/test/.test(DB)) {
+  throw new Error(`本番/開発DBには流さないでください: ${DB}\nDATABASE_URL をテスト用DBに向けてください。`);
+}
+
+// 専用ユーザーを用意する。.env の IKKOMA_USER_ID は開発DBのものなので使わない。
+const sql = postgres(DB, { max: 1 });
+const [smokeUser] = await sql`
+  insert into users (email, display_name) values ('mcp-smoke@example.com', 'smoke')
+  on conflict (email) do update set display_name = 'smoke'
+  returning id`;
+await sql.end();
+console.log(`テストDB: ${DB}`);
+console.log(`スモーク用ユーザー: ${smokeUser.id}\n`);
 
 const transport = new StdioClientTransport({
   command: "npx",
-  args: ["tsx", "mcp/server.ts"],
-  env: { ...process.env } as Record<string, string>,
+  args: ["tsx", "--tsconfig", "tsconfig.json", "mcp/server.ts"],
+  env: { ...process.env, DATABASE_URL: DB, IKKOMA_USER_ID: smokeUser.id } as Record<string, string>,
 });
 const client = new Client({ name: "smoke", version: "0.0.1" });
 await client.connect(transport);
