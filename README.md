@@ -39,7 +39,13 @@ createdb ikkoma
 npm run db:push               # スキーマ適用
 npm run db:seed               # study リポジトリの Markdown を取り込む
 # → 出力された user id を .env の IKKOMA_USER_ID に設定
-npm run dev
+npm run dev                   # http://localhost:3100
+```
+
+ポートは既定 3100。他と被るときはシェル環境変数で上書きする（`.env` ではなくシェル側）。
+
+```bash
+PORT=3200 npm run dev
 ```
 
 `npm run db:seed` は `~/Documents/workspace/study`（`STUDY_REPO_PATH` で変更可）の
