@@ -5,15 +5,21 @@
  *   STUDY_REPO_PATH=~/Documents/workspace/study npm run db:import-study
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { eq } from "drizzle-orm";
-import { db } from "../lib/db";
-import {
+
+// DB モジュールを読む前に .env をロードする（リポジトリ基準。cwd に依存させない）
+const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
+try { process.loadEnvFile?.(join(repoRoot, ".env")); } catch { /* env は外から渡されている */ }
+
+const { db } = await import("../lib/db");
+const {
   milestones, notificationSettings, reviewState, rhythmPhases, rhythmSlots,
-  streaks, topicMenuTemplates, topics, users, weaknessTypes,
-} from "../lib/db/schema";
-import { initialReviewState } from "../lib/domain/review";
+  sessions, streaks, topicMenuTemplates, topics, users, weaknessTypes,
+} = await import("../lib/db/schema");
+const { initialReviewState } = await import("../lib/domain/review");
 
 const REPO = (process.env.STUDY_REPO_PATH ?? join(homedir(), "Documents/workspace/study"))
   .replace(/^~/, homedir());
@@ -45,7 +51,11 @@ type ParsedTopic = {
   title: string; goal: string; status: "active" | "paused" | "done";
   currentState: string; progress: number;
   milestones: { code: string; title: string; detail: string; done: boolean }[];
-  weaknesses: string[];
+  weaknesses: {
+    label: string; description: string; occurrenceCount: number;
+    exampleWrong: string | null; exampleRight: string | null;
+  }[];
+  logs: { date: string; minutes: number; summary: string }[];
   nextActions: string[];
   menuTemplate: { blockKind: "drill" | "writing_check"; minutes: number; instruction: string }[];
 };
@@ -62,10 +72,34 @@ function parseTopic(md: string): ParsedTopic {
     if (m) ms.push({ done: m[1] === "x", code: m[2], title: m[3].replace(/\*\*/g, "").trim(), detail: "" });
   }
 
-  const weaknesses: string[] = [];
+  const weaknesses: ParsedTopic["weaknesses"] = [];
   for (const line of section(md, "弱点リスト").split("\n")) {
     const m = line.match(/^- \[[ x]\] (.+)$/);
-    if (m) weaknesses.push(m[1].replace(/\*\*/g, "").replace(/※.*$/, "").trim());
+    if (!m) continue;
+    const raw = m[1].replace(/\*\*/g, "");
+    // 「※…にも再発」の注記は発生回数と例文を持っているので、捨てる前に拾う
+    const note = raw.match(/※(.*)$/)?.[1] ?? "";
+    const body = raw.replace(/※.*$/, "").trim();
+    const [head, ...rest] = body.split(/[（(]/);
+    // 「× checked mail → checked the email」形式の例。
+    // 正解の後ろに解説が続くことがあるので最初の文で切る。
+    const ex = (note + body).match(/×\s*([^→)）]+?)\s*→\s*([^)）]+)/);
+    const trim = (v: string | undefined) =>
+      v ? v.split(/[。．]/)[0].replace(/^[○×]\s*/, "").trim() || null : null;
+    weaknesses.push({
+      label: head.trim(),
+      description: rest.join("(").replace(/[)）]\s*$/, "").trim(),
+      occurrenceCount: /再発/.test(note) ? 2 : 1,
+      exampleWrong: trim(ex?.[1]),
+      exampleRight: trim(ex?.[2]),
+    });
+  }
+
+  // 学習ログ表: | 2026-09-06 | 45分 | 内容 |
+  const logs: ParsedTopic["logs"] = [];
+  for (const line of section(md, "学習ログ").split("\n")) {
+    const m = line.match(/^\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*(\d+)\s*分\s*\|\s*(.+?)\s*\|$/);
+    if (m) logs.push({ date: m[1], minutes: Number(m[2]), summary: m[3].trim() });
   }
 
   const nextActions: string[] = [];
@@ -91,7 +125,7 @@ function parseTopic(md: string): ParsedTopic {
     goal: field(md, "目標") ?? title,
     currentState: field(md, "現在地") ?? "",
     progress: Number((field(md, "進捗") ?? "0").replace("%", "")) || 0,
-    milestones: ms, weaknesses, nextActions, menuTemplate,
+    milestones: ms, weaknesses, logs, nextActions, menuTemplate,
   };
 }
 
@@ -112,6 +146,7 @@ async function main() {
 
   const files = readdirSync(join(REPO, "topics")).filter((f) => f.endsWith(".md"));
   const created: { id: string; title: string; status: string }[] = [];
+  let importedLogs = 0;
 
   for (const [i, file] of files.entries()) {
     const parsed = parseTopic(readFileSync(join(REPO, "topics", file), "utf8"));
@@ -133,15 +168,26 @@ async function main() {
     })));
 
     // 弱点リストは承認済みとして取り込み、その日から間隔反復に乗せる
-    for (const label of parsed.weaknesses) {
-      const [head, ...rest] = label.split(/[（(]/);
+    for (const wk of parsed.weaknesses) {
       const [w] = await db.insert(weaknessTypes).values({
         userId: user.id, topicId: t.id,
-        label: head.trim(),
-        description: rest.join("(").replace(/[)）]\s*$/, "").trim(),
-        origin: "manual", approved: true, occurrenceCount: label.includes("再発") ? 2 : 1,
+        label: wk.label, description: wk.description,
+        exampleWrong: wk.exampleWrong, exampleRight: wk.exampleRight,
+        origin: "manual", approved: true, occurrenceCount: wk.occurrenceCount,
       }).returning();
       await db.insert(reviewState).values({ typeId: w.id, ...initialReviewState(TODAY) });
+    }
+
+    // 学習ログを完了済みセッションとして取り込む（ヒートマップと累計時間の元になる）
+    if (parsed.logs.length) {
+      await db.insert(sessions).values(parsed.logs.map((l) => ({
+        userId: user.id, topicId: t.id, state: "completed" as const,
+        summary: l.summary, durationMinutes: l.minutes,
+        // 時刻は記録されていないので JST 正午に置く
+        startedAt: new Date(`${l.date}T12:00:00+09:00`),
+        endedAt: new Date(`${l.date}T12:00:00+09:00`),
+      })));
+      importedLogs += parsed.logs.length;
     }
 
     created.push({ id: t.id, title: t.title, status: t.status });
@@ -193,6 +239,7 @@ async function main() {
   console.log(`  user id : ${user.id}   ← .env の IKKOMA_USER_ID に入れてください`);
   console.log(`  topics  : ${created.map((c) => `${c.title}(${c.status})`).join(", ")}`);
   console.log(`  streak  : 現在${s.currentStreak}日 / 最長${s.longestStreak}日 / 累計${s.totalDays}日`);
+  console.log(`  logs    : ${importedLogs}件の学習ログをセッションとして取り込み`);
   process.exit(0);
 }
 
